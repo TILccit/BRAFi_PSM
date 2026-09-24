@@ -1,0 +1,567 @@
+---
+title: "Propensity Scores Calculation and Survival Analysis"
+subtitle: <center> Parial responders </center>
+author: "Mario Presti"
+date: '`r paste("First created on May 2025 Updated on ", format(Sys.Date(), "%d %B %Y"))`'
+output:
+  github_document:
+    toc: true
+    toc_depth: 5
+---
+
+# Introduction
+
+This analysis investigates propensity score matching in patients based on PD-L1 expression and other clinical parameters.
+
+# Loading Libraries
+
+```{r dataLoad,warning=F, message=F,eval=TRUE}
+# Loading CSV file with patient info
+# Load required libraries
+library(data.table)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(MatchIt)
+library(survival)
+library(survminer)
+library(survey)
+library(compareGroups)
+library(cobalt)
+library(ggsurvfit)
+library(openxlsx)
+library(knitr)
+source("Scripts/PSM_survival_function.R")
+
+```
+
+## Pre-processing of data
+
+* Check that all columns have no spaces etc, especially character columns, 
+* transform character columns to factors. 
+* Check if all factors are ok.
+* Check numerical columns.
+
+We first need to define which columns we want as character (categorical), and which need to be numerical. Sometimes things get messed up with excel files.
+
+```{r,warning=F, message=F,eval=TRUE}
+# Column transformations for consistency
+# setwd("")
+dataDF <- read.xlsx(xlsxFile = "Data/Post-TIL_BRAF_propensity_matching.xlsx", check.names = T)
+
+# Check for duplicates
+any(duplicated(dataDF$patient_id))
+
+# Remove duplicates
+dataDF <- dataDF[!duplicated(dataDF), ]
+
+## HERE we define for which parameters we want to do univariate analysis, and which to include in the multivariate survival analysis.
+## PLEASE define name as it is on the csv file, the name needs to be in BRACKETS
+features <- c("ECOG.PS", "LDH.elevated.","CNS.metastases","Treatment.line","Best.response.to.BRAFi.post.TIL")
+
+## Define which columns include survival data
+OS_time <- c("OS.months")
+OS_status <- c("OS.event")
+PFS_time <- c("PFS.months")
+PFS_status <- c("PFS.event")
+
+## DEFINE IF YOU ARE DOING OS OR PFS
+surv_time <- PFS_time
+surv_status <- PFS_status
+surv_time_label <- "PFS"
+
+# KM plots labels
+xlabel=".PFS.days"
+
+## DEFINE WHICH COLUMNS ARE CATEGORICAL
+categ_feats <-setdiff(features, c("ECOG.PS"))
+
+## DEFINE WHICH COLUMNS ARE NUMERICAL
+# we also add the status and time columns
+numeric_feats <- c(OS_time,OS_status,PFS_time,PFS_status, setdiff(features, categ_feats))
+
+## FIRST MAKE SURE THERE ARE NO BLANKS ANYWHERE IN THE DATA
+## Find non-Numeric columns
+num_cols <- unlist(lapply(dataDF, is.numeric))         
+
+dataDF <- cbind(apply(dataDF[,!num_cols], 2, str_remove_all, "NA"),dataDF[,num_cols])   
+
+### NOW MAKE SURE THAT THE COLUMNS ARE IN THE CORRECT FORMAT NEEDED FOR ANALYSIS.
+## Numeric columns
+dataDF <- dataDF %>% mutate(across(all_of(numeric_feats), as.numeric))
+
+## Categorical
+dataDF <- dataDF %>% mutate(across(all_of(categ_feats), as.character))
+
+# We need to transform character columns to categorical, to have the different levels
+dataDF <- dataDF %>% mutate(across(all_of(categ_feats), as.factor))
+dataDF <- dataDF %>% select(all_of(c(colnames(dataDF)[1], OS_time,OS_status, PFS_time,PFS_status, features))) %>% distinct()
+
+dim(dataDF)
+
+# To remove both (NAs):
+dataDF <- dataDF %>% drop_na
+
+#code LDH column
+dataDF <- dataDF %>% dplyr::mutate(
+    LDH.elevated. = case_when(
+      LDH.elevated. == "No"  ~ "0",
+      LDH.elevated. == "Yes"  ~ "1",
+      LDH.elevated. == "Unknown"  ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    LDH.elevated. = factor(
+      LDH.elevated.,
+      levels = c("1", "0")
+    )
+)
+
+dim(dataDF)
+
+table(dataDF$Treatment.line)
+
+table(dataDF$Treatment.line, dataDF$Best.response.to.BRAFi.post.TIL)
+
+## LET's LOOK AT A SUMMARY OF THE DATA
+summary(dataDF)
+```
+
+```{r Massaging dammed data}
+# Column transformations for consistency
+dataDF_dammed <- fread("Data/udtræks_forsøg_KM04042025_metast.csv")
+#only BRAF/MEK treated patients
+dataDF_dammed <- subset(dataDF_dammed, regime_id_combined %in% c("BRAF/MEK inhibitors"))
+# Remove duplicates
+dataDF_dammed <- dataDF_dammed[-which(duplicated(dataDF_dammed$record_id)),]
+#keep only > 1 line patients
+dataDF_dammed <- subset(dataDF_dammed, line_therapy > 1)
+
+#calculate age
+dataDF_dammed$regime_start_date_correct <- as.Date(dataDF_dammed$regime_start_date, format = "%d-%m-%Y")
+dataDF_dammed$birthdate_correct <- as.Date(dataDF_dammed$birthdate, format = "%d-%m-%Y")
+dataDF_dammed$age <- difftime(dataDF_dammed$regime_start_date_correct, dataDF_dammed$birthdate_correct)/365
+
+#calculate os
+dataDF_dammed$date_last_alive <- as.Date(dataDF_dammed$date_last_alive, format = "%d-%m-%Y")
+dataDF_dammed$date_death <- as.Date(dataDF_dammed$date_death, format = "%d-%m-%Y")
+dataDF_dammed <- dataDF_dammed %>%
+  mutate(
+    date_OS_calc = coalesce(date_last_alive, date_death)      # take a unless it’s NA, otherwise b
+  )
+dataDF_dammed$OS.months <- difftime(dataDF_dammed$date_OS_calc, dataDF_dammed$regime_start_date_correct, units = "days")/30.44
+
+dataDF_dammed$date_progression <- as.Date(dataDF_dammed$date_progression, format = "%d-%m-%Y")
+dataDF_dammed$date_seen_no_progression <- as.Date(dataDF_dammed$date_seen_no_progression, format = "%d-%m-%Y")
+dataDF_dammed <- dataDF_dammed %>%
+  mutate(
+    date_PFS_calc = coalesce(date_progression, date_seen_no_progression)      # take a unless it’s NA, otherwise b
+  )
+dataDF_dammed$PFS.months <- difftime(dataDF_dammed$date_PFS_calc, dataDF_dammed$regime_start_date_correct,units = "days")/30.44
+
+#code OS and PFS events
+dataDF_dammed <- dataDF_dammed %>% dplyr::mutate(
+  OS.event = case_when(
+    is.na(dataDF_dammed$date_death)  ~ "0",
+    !(is.na(dataDF_dammed$date_death))  ~ "1",
+    TRUE ~ NA_character_
+  ),
+  OS.event = factor(
+    OS.event,
+    levels = c("1", "0")
+  ),
+  PFS.event = case_when(
+    !(is.na(dataDF_dammed$date_progression))  ~ "1",
+    !(is.na(dataDF_dammed$date_death))  ~ "1",
+    is.na(dataDF_dammed$date_progression) & is.na(dataDF_dammed$date_death) ~ "0",
+    TRUE ~ NA_character_
+  ),
+  PFS.event = factor(
+    PFS.event,
+    levels = c("1", "0")
+)
+)
+
+#code LDH column
+dataDF_dammed <- dataDF_dammed %>% dplyr::mutate(
+    LDH.elevated. = case_when(
+      ldh > 255 & age >= 70  ~ "1",
+      ldh < 255 & age >= 70  ~ "0",
+      ldh > 205 & age < 70  ~ "1",
+      ldh < 205 & age < 70  ~ "0",
+      TRUE ~ NA_character_
+    ),
+    LDH.elevated. = factor(
+      LDH.elevated.,
+      levels = c("1", "0")
+    )
+)
+
+#rename columns of interest
+names(dataDF_dammed)[names(dataDF_dammed) == 'performance_status'] <- 'ECOG.PS'
+names(dataDF_dammed)[names(dataDF_dammed) == 'metastasis_brain___1'] <- 'CNS.metastases'
+names(dataDF_dammed)[names(dataDF_dammed) == 'line_therapy'] <- 'Treatment.line'
+names(dataDF_dammed)[names(dataDF_dammed) == 'bedste_respons'] <- 'Best.response.to.BRAFi.post.TIL'
+names(dataDF_dammed)[names(dataDF_dammed) == 'record_id'] <- 'Center.Unique.ID'
+
+#code Treatment line column
+dataDF_dammed <- dataDF_dammed %>% dplyr::mutate(
+    Treatment.line = case_when(
+      Treatment.line == 2  ~ "2",
+      Treatment.line >= 3   ~ "3 or higher",
+      TRUE ~ NA_character_
+    ),
+    Treatment.line = factor(
+      Treatment.line,
+      levels = c("2", "3 or higher")
+    )
+)
+# code CNS mets line column
+dataDF_dammed <- dataDF_dammed %>% dplyr::mutate(
+    CNS.metastases = case_when(
+      CNS.metastases == 0  ~ "No",
+      CNS.metastases == 1   ~ "Yes",
+      TRUE ~ NA_character_
+    ),
+    CNS.metastases = factor(
+      CNS.metastases,
+      levels = c("No", "Yes")
+    )
+)
+
+#keep only relevant columns
+common_cols <- intersect(colnames(dataDF_dammed), colnames(dataDF))
+
+dataDF_dammed <- dataDF_dammed[, ..common_cols]
+
+## Find non-Numeric columns
+num_cols <- unlist(lapply(dataDF_dammed, is.numeric))         # Identify numeric columns
+
+### NOW MAKE SURE THAT THE COLUMNS ARE IN THE CORRECT FORMAT NEEDED FOR ANALYSIS.
+## Numeric columns
+dataDF_dammed <- dataDF_dammed %>%
+  mutate(across(all_of(numeric_feats),
+                ~ as.numeric(as.character(.))))
+
+## Categorical
+dataDF_dammed <- dataDF_dammed %>% mutate(across(all_of(categ_feats), as.character))
+
+#remove NAs
+dataDF_dammed <- dataDF_dammed %>%
+  # 1) if you really want to strip the literal text "NA" out of character columns:
+  mutate(across(
+    where(is.character),
+    ~ str_replace_all(., "\\bNA\\b", "")  # removes the letters NA, but leaves true NA untouched
+  )) %>%
+  # 2) now drop _entire rows_ that still have any real NA
+  filter(if_all(everything(), ~ !is.na(.)))
+
+dim(dataDF_dammed)
+```
+
+#Cohort joining in one
+```{r Cohort joining}
+dataDF$Cohort <- "TIL"
+dataDF_dammed$Cohort <- "No TIL"
+
+dataDF_merge <- dataDF %>%
+  bind_rows(
+    dataDF_dammed)
+dataDF_merge$Cohort <- as.factor(dataDF_merge$Cohort)
+dataDF_merge <- dataDF_merge %>%
+  # 1) if you really want to strip the literal text "NA" out of character columns:
+  mutate(across(
+    where(is.character),
+    ~ str_replace_all(., "\\bNA\\b", "")  # removes the letters NA, but leaves true NA untouched
+  )) %>%
+  # 2) now drop _entire rows_ that still have any real NA
+  filter(if_all(everything(), ~ !is.na(.)))
+
+## Numeric columns
+dataDF_merge <- dataDF_merge %>%
+  mutate(across(all_of(numeric_feats),
+                ~ as.numeric(as.character(.))))
+
+dataDF_merge <- dataDF_merge %>%
+  mutate(
+    across(
+      where(is.character),
+      ~ gsub(" ", "_", .)
+    )
+  )
+dataDF_merge <- dataDF_merge %>%
+  mutate(across(where(is.factor), as.character)) %>%
+  mutate(across(where(is.character), ~ gsub(" ", "_", .)))
+
+## FIRST MAKE SURE THERE ARE NO BLANKS ANYWHERE IN THE DATA
+## Find non-Numeric columns
+num_cols <- unlist(lapply(dataDF_merge, is.numeric))         # Identify numeric columns
+
+### NOW MAKE SURE THAT THE COLUMNS ARE IN THE CORRECT FORMAT NEEDED FOR ANALYSIS.
+## Numeric columns
+dataDF_merge <- dataDF_merge %>% mutate(across(all_of(numeric_feats), as.numeric))
+
+## Categorical
+categ_feats <- c(categ_feats, "Cohort")
+dataDF_merge <- dataDF_merge %>% mutate(across(all_of(categ_feats), as.character))
+
+# We need to transform character columns to categorical, to have the different levels
+dataDF_merge <- dataDF_merge %>% mutate(across(all_of(categ_feats), as.factor))
+dataDF <- dataDF_merge %>% select(all_of(c(colnames(dataDF_merge)[1], OS_time,OS_status, PFS_time,PFS_status, features))) %>% distinct()
+
+```
+
+
+# Survival analysis using unmatched patient data
+## Overall survival
+```{r OS unmatched, warning=FALSE, message=FALSE, fig.width=16, fig.height=8, eval=TRUE}
+# Survival object
+surv_obj <- Surv(dataDF_merge$OS.months, dataDF_merge$OS.event)
+
+# Combine all variables into a data frame
+data <- cbind(dataDF_merge, surv_obj)
+
+# Compute the Kaplan-Meier model
+fit_overall = survfit(Surv(dataDF_merge$OS.months, dataDF_merge$OS.event) ~ Cohort, data=dataDF_merge)
+print(fit_overall)
+
+# Modify the names of the strata to remove "regime_correct="
+names(fit_overall$strata) <- sub("Cohort =", " ", names(fit_overall$strata))
+
+OVS_all <- ggsurvfit(fit_overall, size = 1.5)               # Adjust the thickness of the lines here
+# add_confidence_interval()
+
+OVS_all +  
+  add_censor_mark() +
+  add_risktable(size = 5,
+                theme = theme_risktable_default(axis.text.y.size = 15,
+                                                plot.title.size = 15),
+    risktable_stats = "{n.risk} ({cum.event})") + 
+  labs( x = "Months", y = "Survival Probability",
+        title = "Overall Survival Responders (All responders)"
+  ) +
+  xlim(0, 120) +                       # Set the limit of the x-axis
+  scale_x_continuous(breaks = seq(0, 120, by = 12)) +  # Break the x-axis in multiples of 12 months
+  scale_y_continuous(
+    breaks = c(0, 0.25, 0.50, 0.75, 1.0),  # Set y-axis breaks
+    limits = c(0, 1)                     # Ensure y-axis limits include all breaks
+  ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme_classic() +  # Apply the classic theme
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18),  # Adjust title size
+    axis.title.x = element_text(size = 20),  # Adjust X label size
+    axis.title.y = element_text(size = 20),  # Adjust Y label size
+    axis.text.x = element_text(size = 15),  # Adjust X-axis tick label size
+    axis.text.y = element_text(size = 15),   # Adjust Y-axis tick label size
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.text       = element_text(size = 18),
+    legend.key.size   = unit(10, "bigpts"),
+    legend.title      = element_blank(),
+  )
+
+# Save the plot to the result folder
+# Save the OVS plot to the result folder
+# file_name_ovs <- file.path(path.expand(result), "Overall_Survival_plot_all.png")  # Define the file path
+#ggsave(file_name_ovs, plot = OVS_all, width = 16, height = 12, units = "in", dpi = 300)  # Save the plot as a PNG file
+
+```
+
+
+## Progression free survival
+```{r PFS unmatched, warning=FALSE, message=FALSE, fig.width=16, fig.height=8, eval=TRUE}
+# Survival object
+surv_obj <- Surv(dataDF_merge$PFS.months, dataDF_merge$PFS.event)
+
+# Combine all variables into a data frame
+data <- cbind(dataDF_merge, surv_obj)
+
+# Compute the Kaplan-Meier model
+fit_pfs = survfit(Surv(dataDF_merge$PFS.months, dataDF_merge$PFS.event) ~ Cohort, data=dataDF_merge)
+print(fit_pfs)
+
+# Modify the names of the strata to remove "regime_correct="
+names(fit_pfs$strata) <- sub("Cohort=", "", names(fit_pfs$strata))
+
+PFS_all <- ggsurvfit(fit_pfs, size = 1.5)               # Adjust the thickness of the lines here
+
+PFS_all +  
+  add_censor_mark() +
+  add_risktable(size = 5,
+                theme = theme_risktable_default(axis.text.y.size = 15,
+                                                plot.title.size = 15),
+    risktable_stats = "{n.risk} ({cum.event})") +
+  labs( x = "Months", y = "Survival Probability",
+        title = "Progression-free Survival Responders (All responders)"
+  ) +
+  xlim(0, 120) +                       # Set the limit of the x-axis
+  scale_x_continuous(breaks = seq(0, 120, by = 12)) +  # Break the x-axis in multiples of 12 months
+  scale_y_continuous(
+    breaks = c(0, 0.25, 0.50, 0.75, 1.0),  # Set y-axis breaks
+    limits = c(0, 1)                     # Ensure y-axis limits include all breaks
+  ) +
+  theme_classic() +                   # Apply the classic theme
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18),  # Adjust title size
+    axis.title.x = element_text(size = 20),  # Adjust X label size
+    axis.title.y = element_text(size = 20),  # Adjust Y label size
+    axis.text.x = element_text(size = 15),  # Adjust X-axis tick label size
+    axis.text.y = element_text(size = 15)   # Adjust Y-axis tick label size
+  )
+
+# Save the plot to the result folder
+# Save the PFS plot to the result folder
+#ggsave(file_name_pfs, plot = PFS_all, width = 16, height = 12, dpi = 600)  # Save the plot as a PNG file
+
+```
+
+# Propensity Score Matching for Treatment Groups Based on Clinical Features
+## Matching with standardized caliper
+```{r,warning=F, message=F, fig.width=16, fig.height=8,eval=TRUE}
+matching_features <- paste0("`", setdiff(features, c("Best.response.to.BRAFi.post.TIL")), "`", collapse = " + ")
+matching_formula <- as.formula(paste0("Cohort ~", matching_features))
+
+comparisons <- list(c("No_TIL", "TIL"))
+
+names(dataDF_merge)[names(dataDF_merge) == 'OS.months'] <- 'OS_months'
+names(dataDF_merge)[names(dataDF_merge) == 'OS.event'] <- 'Dead'
+names(dataDF_merge)[names(dataDF_merge) == 'PFS.months'] <- 'PFS_months'
+names(dataDF_merge)[names(dataDF_merge) == 'PFS.event'] <- 'Progressed'
+
+OS_psm_all <- run_psm_and_survival(dataDF = dataDF_merge, comparisons = comparisons,covariate_to_split = "Cohort", endpoint = "OS", truncate_month = 60)
+PFS_psm_all <- run_psm_and_survival(dataDF = dataDF_merge, comparisons = comparisons,covariate_to_split = "Cohort", endpoint = "PFS", truncate_month = 60)
+
+OS_psm_all$surv_plots
+PFS_psm_all$surv_plots
+```
+
+
+# Clinical characterization of the propensity-matched cohorts
+## Median OS and PFS tables
+```{r,warning=F, message=F, fig.width=16, fig.height=8,eval=TRUE}
+matched_ids <- OS_psm_all$matched_dfs[[1]]$Center.Unique.ID
+df_matched <- subset(dataDF_merge,Center.Unique.ID %in% matched_ids )
+
+df_matched <- df_matched %>%
+  mutate(
+    across(
+      all_of(c("OS_months", "Dead", "PFS_months", "Progressed")),
+      as.numeric
+    )
+  )
+
+fit_OS_matched <- survfit(
+  Surv(df_matched$OS_months, df_matched$Dead) ~ 1,
+  data=df_matched
+)
+
+fit_OS_matched_treatment <- survfit(
+  Surv(df_matched$OS_months, df_matched$Dead) ~ Cohort,
+  data=df_matched
+)
+
+fit_PFS_matched <- survfit(
+  Surv(PFS_months, Progressed) ~ 1,
+  data = df_matched
+)
+
+fit_PFS_matched_treatment <- survfit(
+  Surv(PFS_months, Progressed) ~ Cohort,
+  data = df_matched
+)
+
+# Helper function
+extract_median_survival <- function(fit, endpoint, stratified = FALSE) {
+  
+  x <- summary(fit)$table
+  
+  if (!stratified) {
+    data.frame(
+      Endpoint = endpoint,
+      Group = "Overall matched cohort",
+      Median = x["median"],
+      `95% CI` = sprintf("%.1f–%.1f", x["0.95LCL"], x["0.95UCL"]),
+      check.names = FALSE
+    )
+  } else {
+    data.frame(
+      Endpoint = endpoint,
+      Group = sub(".*=", "", rownames(x)),
+      Median = x[, "median"],
+      `95% CI` = sprintf("%.1f–%.1f", x[, "0.95LCL"], x[, "0.95UCL"]),
+      check.names = FALSE
+    )
+  }
+}
+
+# Combine results
+survival_summary <- bind_rows(
+  extract_median_survival(fit_OS_matched, "Overall survival (OS)"),
+  extract_median_survival(fit_OS_matched_treatment, "Overall survival (OS)", TRUE),
+  extract_median_survival(fit_PFS_matched, "Progression-free survival (PFS)"),
+  extract_median_survival(fit_PFS_matched_treatment, "Progression-free survival (PFS)", TRUE)
+)
+
+# Pretty Markdown table
+kable(
+  survival_summary,
+  row.names = F,
+  digits = 1,
+  align = c("l", "l", "r", "r"),
+  caption = "Median survival in the propensity score–matched cohort"
+)
+```
+
+##BOR distribution
+```{r,fig.width=16, fig.height=8,eval=TRUE}
+## OR distribution
+table(df_matched$Best.response.to.BRAFi.post.TIL)
+table(df_matched$Best.response.to.BRAFi.post.TIL, df_matched$Cohort)
+
+#presented as piechart
+pie_overall <- df_matched %>%
+  filter(!is.na(Best.response.to.BRAFi.post.TIL)) %>%
+  count(Best.response.to.BRAFi.post.TIL) %>%
+  mutate(
+    pct = n / sum(n) * 100,
+    label = paste0(Best.response.to.BRAFi.post.TIL, "\n", n, " (", round(pct, 1), "%)")
+  )
+
+ggplot(pie_overall, aes(x = "", y = n, fill = Best.response.to.BRAFi.post.TIL)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(
+    title = "Best overall response to BRAF/MEKi",
+    fill = "Response"
+  ) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 4)+
+   theme(strip.text = element_text(size=20),
+        title = element_text(size = 20))
+
+### BOR by cohort
+pie_by_cohort <- df_matched %>%
+  filter(!is.na(Best.response.to.BRAFi.post.TIL), !is.na(Cohort)) %>%
+  count(Cohort, Best.response.to.BRAFi.post.TIL) %>%
+  group_by(Cohort) %>%
+  mutate(
+    pct = n / sum(n) * 100,
+    label = paste0(Best.response.to.BRAFi.post.TIL, "\n", n, " (", round(pct, 1), "%)")
+  ) %>%
+  ungroup()
+
+ggplot(pie_by_cohort, aes(x = "", y = n, fill = Best.response.to.BRAFi.post.TIL)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  facet_wrap(~ Cohort) +
+  theme_void() +
+  labs(
+    title = "Best overall response to BRAF/MEKi, stratified by response",
+    fill = "Response"
+  ) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3.5)+
+  theme(strip.text = element_text(size=20),
+        title = element_text(size = 20))
+```
+
